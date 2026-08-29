@@ -14,20 +14,19 @@
 import numpy as np
 import random
 # Sample player outcomes are used to simulate the variability in player performance, which is crucial for realistic draft simulations.
-# Load samples from CSV provides the initial player data, while sample_player_points generates random outcomes based on Min, max, and stdevs
-from sample_player_outcomes import load_samples_from_csv
+# Caller is responsible for calling load_samples_from_csv(...) for the correct league before using this class.
 from sample_player_outcomes import sample_player_points
 
-load_samples_from_csv(r"C:\Users\onlyu\OneDrive\Fantasy Football\data\data_clean\player_weekly_projections_ppr\projections_2025_wk0.csv") 
 
 class DraftSim:
     """This class simulates a fantasy football draft environment for reinforcement learning.
     It manages the draft state, including available players, team rosters, and draft order. 
     The simulation enforces positional limits and allows for dynamic updates to player availability and projected points based on the current pick number.
     """
-    def __init__(self, player_pool, num_rounds, my_pick = None, num_teams=12, ):
+    def __init__(self, player_pool, num_rounds, my_pick = None, num_teams=12, starter_limits=None, position_limits=None):
         # instance variables
         self.num_teams = num_teams
+        self.num_rounds = num_rounds
         # can choose a pick number for when I know my pick, or random one for drafts we don't know
         self.my_pick = my_pick if my_pick is not None else random.randint(0, num_teams - 1) 
         self.current_pick_number = 0
@@ -42,20 +41,22 @@ class DraftSim:
         interference from the ongoing draft state."""
         self.done = False
 
-        self.STARTER_LIMITS = {
-            "QB": 1,
-            "RB": 2,
-            "WR": 3,
-            "TE": 1,
-            "FLEX": 1,     # can be RB, WR, or TE
-        }
+        # Defaults match a standard 2-WR-starter league; pass starter_limits (e.g. from
+        # RL_draft_env.LEAGUE_CONFIGS) to override for leagues like the 3-WR keeper league.
+        self.STARTER_LIMITS = starter_limits #or {
+        #    "QB": 1,
+        #    "RB": 2,
+        #    "WR": 2,
+        #    "TE": 1,
+        #    "FLEX": 1,     # can be RB, WR, or TE
+        #}
         
-        self.POSITION_LIMITS = {
-        "QB": 2,
-        "RB": 7,
-        "WR": 7,
-        "TE": 2,
-        }
+        self.POSITION_LIMITS = position_limits #or {
+        #"QB": 3,
+        #"RB": 7,
+        #"WR": 7,
+        #"TE": 3,
+        #}
         # List of positions that qualify as FLEX
         self.FLEX_ELIGIBLE = ["RB", "WR", "TE"]
         
@@ -75,7 +76,7 @@ class DraftSim:
                 .sort_values("Rolling ADP").head(n)["Player"].tolist()
             # Top n by FP (VBD/projection)
             vbd_top = self.available_players[self.available_players["Position"] == pos] \
-                .sort_values("FP", ascending=False).head(n)["Player"].tolist()
+                .sort_values("points", ascending=False).head(n)["Player"].tolist()
             # Combine and deduplicate
             result.update(adp_top)
             result.update(vbd_top)
@@ -88,6 +89,7 @@ class DraftSim:
     
     def get_offset_for_adp(adp, ecr, weight=0.5):
         offset_ecr = 0.0968 * ecr + 3.63
+        30.62
         offset_adp = 0.165 * adp + 0.835
 
         blended_offset = weight * offset_adp + (1 - weight) * offset_ecr
@@ -98,7 +100,7 @@ class DraftSim:
         """Recalculates the "Rolling ADP" for all available players
         to help bot determine the top remaining players for each position, to help the bot choose best available player """
         sorted_df = self.available_players.sort_values("ESPN ADP").reset_index(drop=True)
-        sorted_df["Rolling ADP"] = range(self.current_pick_number, self.current_pick_number + len(sorted_df))
+        sorted_df["Rolling ADP"] = range(self.current_pick, self.current_pick + len(sorted_df))
         self.available_players["Rolling ADP"] = self.available_players["Player"].map(dict(zip(sorted_df["Player"], sorted_df["Rolling ADP"])))
         
     
@@ -145,6 +147,9 @@ class DraftSim:
 
         self.available_players = self.available_players[self.available_players["Player"] != player_name]
         self.rosters[team_idx].append(player)
+        # Round is 0-indexed by picks-per-team so far this pick
+        current_round = self.current_pick // self.num_teams
+        self.draft_history[current_round].append(player)
         self.current_pick += 1
         self.update_rolling_adp()
         self.done = self.current_pick >= self.total_picks
@@ -155,6 +160,7 @@ class DraftSim:
         self.done = False
         self.rosters = [[] for _ in range(self.num_teams)]
         self.available_players = self.player_pool.copy()
+        self.draft_history = [[] for _ in range(self.num_rounds)]
         self.update_rolling_adp()
 
     def get_valid_actions(self):
@@ -186,23 +192,30 @@ class DraftSim:
         positions = [p['Position'] for p in my_team]
         pos_counts = {pos: positions.count(pos) for pos in ["QB", "RB", "WR", "TE"]}
         
+        # 2. Remember position pick by round
+        position_by_round = {rnd: {pos: 0 for pos in ["QB", "RB", "WR", "TE"]} for rnd in range(self.num_rounds)}
+        for rnd, picks in enumerate(self.draft_history):
+            for p in picks:
+                if p['Position'] in position_by_round[rnd]:
+                    position_by_round[rnd][p['Position']] += 1 
+        
         # 2. Roster Quality by position
-        pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
-        for p in my_team:
-            pos_tiers[p['Position']].append(p['Tier'])
+        #pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
+        #for p in my_team:
+        #    pos_tiers[p['Position']].append(p['Tier'])
             
         # 3. Injury risk low med high by position
         # Removeing for now since it may not be necessary for the state representation, but can be added back in if needed
-        injury_risk_counts = {pos: {"Low": 0, "Medium": 0, "High": 0} for pos in ["QB", "RB", "WR", "TE"]}
-        for p in my_team:
-            injury_risk_counts[p['Position']][p['Injury Risk']] += 1 
+        #injury_risk_counts = {pos: {"Low": 0, "Medium": 0, "High": 0} for pos in ["QB", "RB", "WR", "TE"]}
+        #for p in my_team:
+        #    injury_risk_counts[p['Position']][p['Injury Risk']] += 1 
             
         # 4. Count of players remaining by position but only at the max tier
         # Going to remove as well for now since it may not be necessary for the state representation, but can be added back in if needed
-        remaining_pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
-        for p in self.available_players.to_dict('records'):
-            if p['Tier'] == max([pl['Tier'] for pl in self.available_players.to_dict('records') if pl['Position'] == p['Position']]):
-                remaining_pos_tiers[p['Position']].append(p['Tier'])
+        #remaining_pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
+        #for p in self.available_players.to_dict('records'):
+        #    if p['Tier'] == max([pl['Tier'] for pl in self.available_players.to_dict('records') if pl['Position'] == p['Position']]):
+        #        remaining_pos_tiers[p['Position']].append(p['Tier'])
             
         
         
@@ -222,10 +235,14 @@ class DraftSim:
             pos_counts.get("RB", 0),
             pos_counts.get("WR", 0),
             pos_counts.get("TE", 0),
-            tuple(pos_tiers.get("QB", [])),
-            tuple(pos_tiers.get("RB", [])),
-            tuple(pos_tiers.get("WR", [])),
-            tuple(pos_tiers.get("TE", []))
+            position_by_round.get(self.current_pick // self.num_teams, {}).get("QB", 0),
+            position_by_round.get(self.current_pick // self.num_teams, {}).get("RB", 0),
+            position_by_round.get(self.current_pick // self.num_teams, {}).get("WR", 0),
+            position_by_round.get(self.current_pick // self.num_teams, {}).get("TE", 0),
+            #tuple(pos_tiers.get("QB", [])),
+            #tuple(pos_tiers.get("RB", [])),
+            #tuple(pos_tiers.get("WR", [])),
+            #tuple(pos_tiers.get("TE", []))
             #tuple(injury_risk_counts.get("QB", {"Low": 0, "Medium": 0, "High": 0}).values()),
             #tuple(injury_risk_counts.get("RB", {"Low": 0, "Medium": 0, "High": 0}).values()),
             #tuple(injury_risk_counts.get("WR", {"Low": 0, "Medium": 0, "High": 0}).values()),
