@@ -16,6 +16,7 @@ import random
 # Sample player outcomes are used to simulate the variability in player performance, which is crucial for realistic draft simulations.
 # Caller is responsible for calling load_samples_from_csv(...) for the correct league before using this class.
 from sample_player_outcomes import sample_player_points
+from season_simulation import simulate_league
 
 
 class DraftSim:
@@ -31,55 +32,56 @@ class DraftSim:
         self.my_pick = my_pick if my_pick is not None else random.randint(0, num_teams - 1) 
         self.current_pick_number = 0
         self.total_picks = num_teams * num_rounds
-        self.rosters = [[] for _ in range(num_teams)]
         self.player_pool = player_pool.copy()
-        self.available_players = player_pool.copy()
+        
+        # Fast dictionary and pre-sorted positional indexing for zero-overhead simulation
+        records = self.player_pool.to_dict("records")
+        self._player_dict = {p["Player"]: p for p in records}
+        self.pos_players = {}
+        for pos in ["QB", "RB", "WR", "TE"]:
+            players_in_pos = [p for p in records if p["Position"] == pos]
+            self.pos_players[pos] = {
+                "adp": sorted(players_in_pos, key=lambda p: p["ESPN ADP"]),
+                "points": sorted(players_in_pos, key=lambda p: p["points"], reverse=True),
+                "ecr": sorted(players_in_pos, key=lambda p: p["ESPN ECR"]),
+                "vor": sorted(players_in_pos, key=lambda p: p["VOR"], reverse=True),
+            }
+
         self.draft_order = list(range(num_teams))
-        """Having both self.player_pool and self.available_players allows the environment to always have access to the original, 
-        complete list of players (self.player_pool), while separately managing the dynamic list of players still available for selection 
-        (self.available_players). This separation is important for resetting the draft or for referencing the full player list without 
-        interference from the ongoing draft state."""
         self.done = False
 
         # Defaults match a standard 2-WR-starter league; pass starter_limits (e.g. from
         # RL_draft_env.LEAGUE_CONFIGS) to override for leagues like the 3-WR keeper league.
-        self.STARTER_LIMITS = starter_limits #or {
-        #    "QB": 1,
-        #    "RB": 2,
-        #    "WR": 2,
-        #    "TE": 1,
-        #    "FLEX": 1,     # can be RB, WR, or TE
-        #}
-        
-        self.POSITION_LIMITS = position_limits #or {
-        #"QB": 3,
-        #"RB": 7,
-        #"WR": 7,
-        #"TE": 3,
-        #}
-        # List of positions that qualify as FLEX
+        self.STARTER_LIMITS = starter_limits
+        self.POSITION_LIMITS = position_limits
         self.FLEX_ELIGIBLE = ["RB", "WR", "TE"]
         
         self.snake_order = []
-        
         for rnd in range(num_rounds):
             if rnd % 2 == 0:
                 self.snake_order.extend(self.draft_order)
             else:
                 self.snake_order.extend(self.draft_order[::-1])
+        
+        self.reset()
 
-    def get_next_n_per_position(self, n=6):
+    @property
+    def available_players(self):
+        """Return DataFrame of currently available players for backward compatibility."""
+        return self.player_pool[self.player_pool["Player"].isin(self.available_set)]
+
+    def get_next_n_per_position(self, n=2):
         result = set()
         for pos in ["QB", "RB", "WR", "TE"]:
-            # Top n by Rolling ADP
-            adp_top = self.available_players[self.available_players["Position"] == pos] \
-                .sort_values("Rolling ADP").head(n)["Player"].tolist()
-            # Top n by FP (VBD/projection)
-            vbd_top = self.available_players[self.available_players["Position"] == pos] \
-                .sort_values("points", ascending=False).head(n)["Player"].tolist()
-            # Combine and deduplicate
-            result.update(adp_top)
-            result.update(vbd_top)
+            pos_data = self.pos_players[pos]
+            for metric in ("adp", "points", "ecr"):
+                count = 0
+                for p in pos_data[metric]:
+                    if p["Player"] in self.available_set:
+                        result.add(p["Player"])
+                        count += 1
+                        if count >= n:
+                            break
         return list(result)
     
     # No self called, so static method
@@ -89,7 +91,6 @@ class DraftSim:
     
     def get_offset_for_adp(adp, ecr, weight=0.5):
         offset_ecr = 0.0968 * ecr + 3.63
-        30.62
         offset_adp = 0.165 * adp + 0.835
 
         blended_offset = weight * offset_adp + (1 - weight) * offset_ecr
@@ -97,11 +98,8 @@ class DraftSim:
     
 
     def update_rolling_adp(self):
-        """Recalculates the "Rolling ADP" for all available players
-        to help bot determine the top remaining players for each position, to help the bot choose best available player """
-        sorted_df = self.available_players.sort_values("ESPN ADP").reset_index(drop=True)
-        sorted_df["Rolling ADP"] = range(self.current_pick, self.current_pick + len(sorted_df))
-        self.available_players["Rolling ADP"] = self.available_players["Player"].map(dict(zip(sorted_df["Player"], sorted_df["Rolling ADP"])))
+        """No-op kept for backwards compatibility."""
+        pass
         
     
     def can_add_player(self, roster, player):
@@ -137,21 +135,19 @@ class DraftSim:
     # It also checks if the draft is complete after the pick.
     def step(self, player_name):
         team_idx = self.snake_order[self.current_pick]
-        player_row = self.available_players[self.available_players["Player"] == player_name]
-        if player_row.empty:
+        if player_name not in self.available_set:
             raise ValueError(f"Player {player_name} not available")
-        player = player_row.iloc[0].to_dict()
+        player = self._player_dict[player_name]
 
         if not self.can_add_player(self.rosters[team_idx], player):
             raise ValueError(f"Cannot add player {player_name} to team {team_idx}")
 
-        self.available_players = self.available_players[self.available_players["Player"] != player_name]
+        self.available_set.remove(player_name)
         self.rosters[team_idx].append(player)
         # Round is 0-indexed by picks-per-team so far this pick
         current_round = self.current_pick // self.num_teams
         self.draft_history[current_round].append(player)
         self.current_pick += 1
-        self.update_rolling_adp()
         self.done = self.current_pick >= self.total_picks
         
     def reset(self):
@@ -159,24 +155,25 @@ class DraftSim:
         self.current_pick = 0
         self.done = False
         self.rosters = [[] for _ in range(self.num_teams)]
-        self.available_players = self.player_pool.copy()
         self.draft_history = [[] for _ in range(self.num_rounds)]
-        self.update_rolling_adp()
+        self.available_set = set(self._player_dict.keys())
 
     def get_valid_actions(self):
         # Get a list of players that can be drafted based on the current state
-        return self.available_players["Player"].tolist()
+        return [p for p in self.player_pool["Player"] if p in self.available_set]
+
+    def get_season_result(self):
+        """Simulate and return this draft's full season result."""
+        return simulate_league(
+            team_rosters=self.rosters,
+            my_team_index=self.my_pick,
+            starter_limits=self.STARTER_LIMITS,
+        )
 
     def get_reward(self, player_lookup):
-        # The calcualtion of the reward helps the bot determine if the action it took was good or bad
-        # Should only calcualte at the end of the draft
-        my_team = self.rosters[self.my_pick]
-        starters = self.get_starting_lineup(my_team, player_lookup)
-        return sum(
-            #sample_player_points(player_lookup.loc[p["Player"]], n=1)[0]
-            np.mean(sample_player_points(player_lookup.loc[p["Player"]], n=10))
-            for p in starters
-        )
+        """Return this draft slot's numeric reward from a simulated season."""
+        season_result = self.get_season_result()
+        return season_result["team_rewards"][self.my_pick]
 
     def get_state(self):
         """State is very important becuase it determines what the the bot sees and how it makes decisions
@@ -192,158 +189,63 @@ class DraftSim:
         positions = [p['Position'] for p in my_team]
         pos_counts = {pos: positions.count(pos) for pos in ["QB", "RB", "WR", "TE"]}
         
-        # 2. Remember position pick by round
-        position_by_round = {rnd: {pos: 0 for pos in ["QB", "RB", "WR", "TE"]} for rnd in range(self.num_rounds)}
-        for rnd, picks in enumerate(self.draft_history):
-            for p in picks:
-                if p['Position'] in position_by_round[rnd]:
-                    position_by_round[rnd][p['Position']] += 1 
-        
-        # 2. Roster Quality by position
-        #pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
-        #for p in my_team:
-        #    pos_tiers[p['Position']].append(p['Tier'])
-            
-        # 3. Injury risk low med high by position
-        # Removeing for now since it may not be necessary for the state representation, but can be added back in if needed
-        #injury_risk_counts = {pos: {"Low": 0, "Medium": 0, "High": 0} for pos in ["QB", "RB", "WR", "TE"]}
-        #for p in my_team:
-        #    injury_risk_counts[p['Position']][p['Injury Risk']] += 1 
-            
-        # 4. Count of players remaining by position but only at the max tier
-        # Going to remove as well for now since it may not be necessary for the state representation, but can be added back in if needed
-        #remaining_pos_tiers = {pos: [] for pos in ["QB", "RB", "WR", "TE"]}
-        #for p in self.available_players.to_dict('records'):
-        #    if p['Tier'] == max([pl['Tier'] for pl in self.available_players.to_dict('records') if pl['Position'] == p['Position']]):
-        #        remaining_pos_tiers[p['Position']].append(p['Tier'])
-            
-        
-        
-        # 5. Count the number of players in each position for all other teams
-        #other_teams = self.rosters[:self.my_pick] + self.rosters[self.my_pick + 1:]
-        #positions = [p['Position'] for team in other_teams for p in team]
-        # Using to count positions across all other teams, but this may not be necessary for the state representation
-        #other_team_counts = {pos: positions.count(pos) for pos in ["QB", "RB", "WR", "TE"]}
-        """other_team_counts = [
-            sum(1 for p in team if p['Position'] == pos)
-            for team in self.rosters if team != my_team
-            for pos in ["QB", "RB", "WR", "TE"]
-        ]"""
-        return (
-            self.current_pick,  
-            pos_counts.get("QB", 0),
-            pos_counts.get("RB", 0),
-            pos_counts.get("WR", 0),
-            pos_counts.get("TE", 0),
-            position_by_round.get(self.current_pick // self.num_teams, {}).get("QB", 0),
-            position_by_round.get(self.current_pick // self.num_teams, {}).get("RB", 0),
-            position_by_round.get(self.current_pick // self.num_teams, {}).get("WR", 0),
-            position_by_round.get(self.current_pick // self.num_teams, {}).get("TE", 0),
-            #tuple(pos_tiers.get("QB", [])),
-            #tuple(pos_tiers.get("RB", [])),
-            #tuple(pos_tiers.get("WR", [])),
-            #tuple(pos_tiers.get("TE", []))
-            #tuple(injury_risk_counts.get("QB", {"Low": 0, "Medium": 0, "High": 0}).values()),
-            #tuple(injury_risk_counts.get("RB", {"Low": 0, "Medium": 0, "High": 0}).values()),
-            #tuple(injury_risk_counts.get("WR", {"Low": 0, "Medium": 0, "High": 0}).values()),
-            #tuple(injury_risk_counts.get("TE", {"Low": 0, "Medium": 0, "High": 0}).values()),
-            #tuple(remaining_pos_tiers.get("QB", [])),
-            #tuple(remaining_pos_tiers.get("RB", [])),
-            #tuple(remaining_pos_tiers.get("WR", [])),
-            #tuple(remaining_pos_tiers.get("TE", [])),
-            #other_team_counts.get("QB", 0),
-            #other_team_counts.get("RB", 0), 
-            #other_team_counts.get("WR", 0),
-            #other_team_counts.get("TE", 0),
+        # 2. Track my own first 6 picks by position
+        # self.rosters[self.my_pick] is already in draft order,
+        # so the first 6 players are my first 6 selections.
+        first_6_picks = [
+            p["Position"]
+            for p in my_team[:6]
+        ]
+
+        # Pad with "None" so the state always has exactly 6 values.
+        # This keeps the state shape consistent during early rounds.
+        first_6_picks += ["None"] * (6 - len(first_6_picks))
+
+        # 3. Rank positions by the best available VOR
+        position_vor = {}
+
+        for pos in ["QB", "RB", "WR", "TE"]:
+            found = False
+            for p in self.pos_players[pos]["vor"]:
+                if p["Player"] in self.available_set:
+                    position_vor[pos] = p["VOR"]
+                    found = True
+                    break
+            if not found:
+                position_vor[pos] = -999
+
+        # Sort positions from highest VOR to lowest VOR
+        vor_ranking = sorted(
+            position_vor,
+            key=position_vor.get,
+            reverse=True
         )
-    def get_starting_lineup(self, team, player_lookup):
-        starter_limits = self.STARTER_LIMITS
-        starters = []
-        used_indices = set()
-        
-        # 1. Fill each position except FLEX
-        for pos, limit in starter_limits.items():
-            if pos == "FLEX":
-                continue
-            # Get all players of this position not already used
-            pos_players = [(i, p) for i, p in enumerate(team) if p["Position"] == pos and i not in used_indices]
-            # Sample and select top players based on mean of 5 samples
-            if pos_players:
-                pos_samples = [
-                    (i, float(np.mean(sample_player_points(player_lookup.loc[p["Player"]], n=10))))
-                    for i, p in pos_players
-                ]
-                # Sort by projected points descending
-                pos_samples.sort(key=lambda x: x[1], reverse=True)
-                # Select top 'limit' players
-                for i, _ in pos_samples[:limit]:
-                    starters.append(team[i])
-                    used_indices.add(i)
-        # 2. Fill FLEX
-        flex_limit = starter_limits.get("FLEX", 0)
-        if flex_limit > 0:
-            flex_eligible = ["RB", "WR", "TE"]
-            # Get all FLEX-eligible players not already used
-            flex_candidates = [
-                (i, p) for i, p in enumerate(team)
-                if p["Position"] in flex_eligible and i not in used_indices
-            ]
-            # Sample and select top players based on mean of 5 samples
-            if flex_candidates:
-                flex_samples = [
-                    (i, float(np.mean(sample_player_points(player_lookup.loc[p["Player"]], n=10))))
-                    for i, p in flex_candidates
-                ]
-                flex_samples.sort(key=lambda x: x[1], reverse=True)
-                for i, _ in flex_samples[:flex_limit]:
-                    starters.append(team[i])
-                    used_indices.add(i)
-                    
-        return starters
-    
-    #def get_starting_lineup(self, team, player_lookup):
-    #    starter_limits = self.STARTER_LIMITS
-    #    starters = []
-    #    # Track used player indices to avoid duplicates
-    #    used_indices = set()
-    #    
-    #    # 1. Fill each position except FLEX
-    #    for pos, limit in starter_limits.items():
-    #        if pos == "FLEX":
-    #            continue
-    #        # Get all players of this position not already used
-    #        pos_players = [(i, p) for i, p in enumerate(team) if p["Position"] == pos and i not in used_indices]
-    #        # Sample and select top players based on projected points
-    #        if pos_players:
-    #            pos_samples = [
-    #                (i, sample_player_points(player_lookup.loc[p["Player"]], n=1)[0])
-    #                for i, p in pos_players
-    #            ]
-    #            # Sort by projected points descending
-    #            pos_samples.sort(key=lambda x: x[1], reverse=True)
-    #            #  Select top 'limit' players
-    #            for i, _ in pos_samples[:limit]:
-    #                starters.append(team[i])
-    #                used_indices.add(i)
-    #    # 2. Fill FLEX
-    #    flex_limit = starter_limits.get("FLEX", 0)
-    #    if flex_limit > 0:
-    #        flex_eligible = ["RB", "WR", "TE"]
-    #        # Get all FLEX-eligible players not already used
-    #        flex_candidates = [
-    #            (i, p) for i, p in enumerate(team)
-    #            if p["Position"] in flex_eligible and i not in used_indices
-    #        ]
-    #        # Sample and select top players based on projected points
-    #        if flex_candidates:
-    #            flex_samples = [
-    #                (i, sample_player_points(player_lookup.loc[p["Player"]], n=1)[0])
-    #                for i, p in flex_candidates
-    #            ]
-    #            # 
-    #            flex_samples.sort(key=lambda x: x[1], reverse=True)
-    #            for i, _ in flex_samples[:flex_limit]:
-    #                starters.append(team[i])
-    #                used_indices.add(i)
-    #                
-    #    return starters
+
+        # Convert position names to numbers
+        position_code = {
+            "QB": 0,
+            "RB": 1,
+            "WR": 2,
+            "TE": 3
+        }
+
+        vor_rank = tuple(
+            position_code[pos]
+            for pos in vor_ranking
+        )
+
+        return (
+            self.current_pick,
+
+            # Roster composition
+            pos_counts["QB"],
+            pos_counts["RB"],
+            pos_counts["WR"],
+            pos_counts["TE"],
+
+            # My first 6 picks
+            *first_6_picks,
+
+            # VOR ranking
+            *vor_rank,
+        )

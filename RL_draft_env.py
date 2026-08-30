@@ -9,10 +9,12 @@ from __future__ import annotations
 import os
 import pickle
 import random
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from draft_sim_class import DraftSim
@@ -28,6 +30,7 @@ LEAGUE_CONFIGS = {
         "sample_csv": BASE_DIR / "data" / "ppr" / "player_samples.csv",
         "q_file": BASE_DIR / "q_table_ppr_2026.pkl",
         "reward_history_file": BASE_DIR / "reward_history_ppr_2026.csv",
+        "evaluation_history_file": BASE_DIR / "evaluation_history_ppr_2026.csv",
         "starter_limits": {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1},
         "position_limits": {"QB": 3, "RB": 8, "WR": 8, "TE": 3},
     },
@@ -35,6 +38,7 @@ LEAGUE_CONFIGS = {
         "sample_csv": BASE_DIR / "data" / "keeper" / "player_samples.csv",
         "q_file": BASE_DIR / "q_table_keeper_2026.pkl",
         "reward_history_file": BASE_DIR / "reward_history_keeper_2026.csv",
+        "evaluation_history_file": BASE_DIR / "evaluation_history_keeper_2026.csv",
         "starter_limits": {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1},
         "position_limits": {"QB": 3, "RB": 7, "WR": 7, "TE": 3},
     },
@@ -42,6 +46,7 @@ LEAGUE_CONFIGS = {
         "sample_csv": BASE_DIR / "data" / "ppr_fd" / "player_samples.csv",
         "q_file": BASE_DIR / "q_table_ppr_fd_2026.pkl",
         "reward_history_file": BASE_DIR / "reward_history_ppr_fd_2026.csv",
+        "evaluation_history_file": BASE_DIR / "evaluation_history_ppr_fd_2026.csv",
         "starter_limits": {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1},
         "position_limits": {"QB": 3, "RB": 8, "WR": 8, "TE": 3},
     },
@@ -87,30 +92,23 @@ def draft_using_q_agent(
     """Run one draft and return the draft environment, log, and state-action history.
     DraftSim is a file / class created to help simulate a real draft"""
     env = DraftSim(df, num_rounds=12, starter_limits=starter_limits, position_limits=position_limits)
-    env.reset()
     state = env.get_state()
-    # set index to "Player" for quick lookups
-    player_lookup = df.set_index("Player")
+    player_dict = env._player_dict
 
-    rolling_adp_lookup = env.available_players.set_index("Player")
     picks_log = []
     history = []
 
     while not env.done:
         # Get the next candidates for the current pick and filter them based on legality
         candidate_names = env.get_next_n_per_position()
-
-        rolling_adp_lookup = env.available_players.set_index("Player")
-        
-        
         team_idx = env.snake_order[env.current_pick]
 
         # Filter candidates to only those that are legal for the current team and pick
         legal_candidates = [
             player_name
             for player_name in candidate_names
-            if player_name in player_lookup.index
-            and env.can_add_player(env.rosters[team_idx], player_lookup.loc[player_name].to_dict())
+            if player_name in player_dict
+            and env.can_add_player(env.rosters[team_idx], player_dict[player_name])
         ]
 
         if not legal_candidates:
@@ -127,58 +125,160 @@ def draft_using_q_agent(
         else:
             sorted_candidates = sorted(
                 legal_candidates,
-                key=lambda player_name: rolling_adp_lookup.loc[player_name, "Rolling ADP"],
+                key=lambda player_name: player_dict[player_name]["ESPN ADP"],
             )
             top_player = sorted_candidates[0]
-            adp = rolling_adp_lookup.loc[top_player, "Rolling ADP"]
-            ecr = player_lookup.loc[top_player]["ESPN ECR"]
+            adp = env.current_pick
+            ecr = player_dict[top_player]["ESPN ECR"]
             offset = DraftSim.get_offset_for_adp(adp, ecr)
             pick_idx = min(max(int(round(offset)), 0), len(sorted_candidates) - 1)
             action = sorted_candidates[pick_idx]
             pick_type = "ADP-Offset"
 
-        selected_rolling_adp = rolling_adp_lookup.loc[action, "Rolling ADP"]
-        env.step(action)
-        sampled_points = sample_player_points(player_lookup.loc[action], n=1)[0]
+        if print_draft:
+            sampled_points = sample_player_points(pd.Series(player_dict[action]), n=1)[0]
+            picks_log.append(
+                {
+                    "Pick #": env.current_pick,
+                    "ADP": player_dict[action]["ESPN ADP"],
+                    "Rolling ADP": env.current_pick,
+                    "Team": team_idx,
+                    "Player": action,
+                    "Position": player_dict[action]["Position"],
+                    "FP": player_dict[action]["points"],
+                    "Sampled FP": sampled_points,
+                    "Pick Type": pick_type,
+                }
+            )
 
-        picks_log.append(
-            {
-                "Pick #": env.current_pick,
-                "ADP": player_lookup.loc[action]["ESPN ADP"],
-                "Rolling ADP": selected_rolling_adp,
-                "Team": team_idx,
-                "Player": action,
-                "Position": player_lookup.loc[action]["Position"],
-                "FP": player_lookup.loc[action]["points"],
-                "Sampled FP": sampled_points,
-                "Pick Type": pick_type,
-            }
-        )
-        history.append((state, action))
+        env.step(action)
+        if team_idx == env.my_pick:
+            history.append((state, action))
         state = env.get_state()
 
+    draft_df = pd.DataFrame(picks_log) if print_draft else pd.DataFrame()
+
     if print_draft:
-        draft_log = pd.DataFrame(picks_log)
         print(f"My Pick: {env.my_pick}")
         for team_id in range(env.num_teams):
             print(f"\nTeam {team_id} Draft:")
-            print(draft_log[draft_log["Team"] == team_id][["Player", "Position", "FP", "Sampled FP", "Pick Type"]].reset_index(drop=True))
+            print(draft_df[draft_df["Team"] == team_id][["Player", "Position", "FP", "Sampled FP", "Pick Type"]].reset_index(drop=True))
 
-    return env, pd.DataFrame(picks_log), history
+    return env, draft_df, history
+
+
+def print_training_inspection(env, draft_log, season_result, block_number, reward):
+    """Print one complete draft and season outcome for a training block."""
+    print(f"\n{'=' * 24} Block {block_number} Inspection {'=' * 24}")
+    print(f"Q-agent team: {env.my_pick} | Reward: ${reward:.2f}")
+    print("\nDraft rosters:")
+    for team_id in range(env.num_teams):
+        roster = env.rosters[team_id]
+        players = ", ".join(f"{p.get('Player', p.get('Name', ''))} ({p.get('Position', '')})" for p in roster)
+        print(f"Team {team_id}: {players}")
+
+    print("\nRegular season:")
+    for weekly_result in season_result["regular_season"]:
+        matchups = " | ".join(
+            f"T{matchup['teams'][0]} {matchup['scores'][0]:.1f} - "
+            f"T{matchup['teams'][1]} {matchup['scores'][1]:.1f} (W: T{matchup['winner']})"
+            for matchup in weekly_result["matchups"]
+        )
+        print(f"Week {weekly_result['week']}: {matchups}")
+
+    print("\nPlayoff seeds:")
+    for seed, team_id in enumerate(season_result["seeds"], start=1):
+        print(
+            f"{seed}. Team {team_id}: {season_result['standings'][team_id]} wins, "
+            f"{season_result['regular_season_points_for'][team_id]:.1f} points"
+        )
+
+    print("\nPlayoffs:")
+    for week_name in ("week_15", "week_16"):
+        print(week_name.replace("_", " ").title() + ":")
+        for matchup in season_result["playoffs"][week_name]:
+            teams = matchup["teams"]
+            scores = matchup["scores"]
+            print(f"T{teams[0]} {scores[0]:.1f} - T{teams[1]} {scores[1]:.1f} (W: T{matchup['winner']})")
+    championship_scores = season_result["playoffs"]["championship_scores"]
+    champion = season_result["playoffs"]["champion"]
+    runner_up = season_result["playoffs"]["runner_up"]
+    championship_teams = season_result["playoffs"]["championship_teams"]
+    print(
+        f"Week 17 Championship: T{championship_teams[0]} {championship_scores[0]:.1f} - "
+        f"T{championship_teams[1]} {championship_scores[1]:.1f} "
+        f"(Champion: T{champion}; Runner-up: T{runner_up})"
+    )
+
+
+def evaluate_q_agent(
+    Q,
+    df,
+    episodes: int = 50,
+    seed: int = 20260828,
+    starter_limits: dict | None = None,
+    position_limits: dict | None = None,
+):
+    """Evaluate the greedy draft policy without updating its Q-values."""
+    random_state = random.getstate()
+    numpy_state = np.random.get_state()
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        rewards = []
+        payouts = []
+        champions = 0
+        runner_ups = 0
+        playoff_appearances = 0
+
+        for _ in range(episodes):
+            env, _, _ = draft_using_q_agent(
+                Q,
+                df,
+                epsilon=0.0,
+                print_draft=False,
+                starter_limits=starter_limits,
+                position_limits=position_limits,
+            )
+            season_result = env.get_season_result()
+            team_id = env.my_pick
+            reward = season_result["team_rewards"][team_id]
+            payout = 7.0 if season_result["playoffs"]["champion"] == team_id else 5.0 if season_result["playoffs"]["runner_up"] == team_id else 0.0
+            rewards.append(reward)
+            payouts.append(payout)
+            champions += payout == 7.0
+            runner_ups += payout == 5.0
+            playoff_appearances += team_id in season_result["seeds"][:6]
+
+        return {
+            "evaluation_episodes": episodes,
+            "average_reward": float(np.mean(rewards)),
+            "average_payout": float(np.mean(payouts)),
+            "champion_rate": champions / episodes,
+            "runner_up_rate": runner_ups / episodes,
+            "playoff_rate": playoff_appearances / episodes,
+        }
+    finally:
+        random.setstate(random_state)
+        np.random.set_state(numpy_state)
 
 
 def train_q_agent(
     Q, # Q-table for the agent
     df, # DataFrame containing player information for the draft
-    alpha: float = 0.1, # Learning rate for the Q-agent meaning how much new information overrides old information
+    alpha: float = 0.1, # Learning rate for the Q-agent
     gamma: float = 1.0, # Discount factor for future rewards
     epsilon: float = 0.3, # Exploration rate for the Q-agent
-    max_blocks: int = 50, # Maximum number of training blocks meaning how many times the agent will go through the entire training process
-    episodes_per_block: int = 300, # Number of episodes (draft simulations) per training block
+    max_blocks: int | None = None, # Maximum number of training blocks (None = run indefinitely until Ctrl+C)
+    episodes_per_block: int = 1000, # Number of episodes (draft simulations) per training block
     q_file: str = "q_table.pkl", # File path to save the Q-table
     reward_history_file: str = "reward_history.csv",
+    evaluation_history_file: str = "evaluation_history.csv",
     starter_limits: dict | None = None,
     position_limits: dict | None = None,
+    inspect_every_blocks: int | None = 10,
+    evaluate_every_blocks: int | None = 10,
+    evaluation_episodes: int = 50,
 ):
     """Train the Q-table using repeated draft simulations."""
     df = pd.DataFrame(df)
@@ -191,37 +291,99 @@ def train_q_agent(
 
     reward_history = []
     last_avg_reward = -float("inf")
+    existing_records: list[dict] = []
 
-    player_lookup = df.set_index("Player")
+    if os.path.exists(reward_history_file) and os.path.getsize(reward_history_file) > 0:
+        try:
+            existing_df = pd.read_csv(reward_history_file)
+            existing_records = existing_df.to_dict("records")
+            if "average_reward" in existing_df.columns and len(existing_df) > 0:
+                last_avg_reward = float(existing_df["average_reward"].iloc[-1])
+            elif len(existing_df) > 0:
+                last_avg_reward = float(existing_df.iloc[-1, 0])
+        except pd.errors.EmptyDataError:
+            existing_records = []
 
-    for block in range(max_blocks):
-        block_rewards = []
+    initial_episodes = len(existing_records) * episodes_per_block
+    evaluation_history = []
+    if os.path.exists(evaluation_history_file) and os.path.getsize(evaluation_history_file) > 0:
+        try:
+            evaluation_history = pd.read_csv(evaluation_history_file).to_dict("records")
+        except pd.errors.EmptyDataError:
+            evaluation_history = []
 
-        for _ in range(episodes_per_block):
-            env, draft_log, history = draft_using_q_agent(
-                Q, df, epsilon=epsilon, print_draft=False, starter_limits=starter_limits, position_limits=position_limits
+    block = 0
+    try:
+        while max_blocks is None or block < max_blocks:
+            block_start = time.perf_counter()
+            block_rewards = []
+
+            for _ in range(episodes_per_block):
+                env, draft_log, history = draft_using_q_agent(
+                    Q, df, epsilon=epsilon, print_draft=False, starter_limits=starter_limits, position_limits=position_limits
+                )
+                season_result = env.get_season_result()
+                reward = season_result["team_rewards"][env.my_pick]
+                block_rewards.append(reward)
+
+                for state, action in history:
+                    Q[state][action] += alpha * (reward - Q[state][action])
+
+            block_time = time.perf_counter() - block_start
+            epsilon = max(0.10, epsilon * 0.95)
+            avg_reward = sum(block_rewards) / len(block_rewards)
+            unique_states = len(Q)
+            total_episodes = initial_episodes + (block + 1) * episodes_per_block
+            delta = avg_reward - last_avg_reward if last_avg_reward != -float("inf") else 0.0
+
+            record = {
+                "average_reward": round(avg_reward, 4),
+                "unique_states": unique_states,
+                "block_time_sec": round(block_time, 2),
+                "total_episodes": total_episodes,
+            }
+            reward_history.append(record)
+
+            max_str = f"{max_blocks:2d}" if max_blocks is not None else "∞"
+            print(
+                f"Block {block + 1:2d}/{max_str} | "
+                f"Time: {block_time:5.2f}s | "
+                f"Total Ep: {total_episodes:6d} | "
+                f"Unique States: {unique_states:6d} | "
+                f"Avg Reward: {avg_reward:5.2f} | "
+                f"Delta: {delta:+5.2f}"
             )
-            reward = env.get_reward(player_lookup)
-            block_rewards.append(reward)
 
-            for state, action in history:
-                Q[state][action] += alpha * (reward - Q[state][action])
+            if inspect_every_blocks and (block + 1) % inspect_every_blocks == 0:
+                print_training_inspection(env, draft_log, season_result, block + 1, reward)
+            if evaluate_every_blocks and (block + 1) % evaluate_every_blocks == 0:
+                evaluation = evaluate_q_agent(
+                    Q,
+                    df,
+                    episodes=evaluation_episodes,
+                    starter_limits=starter_limits,
+                    position_limits=position_limits,
+                )
+                evaluation["block"] = block + 1
+                evaluation_history.append(evaluation)
+                print(
+                    f"Evaluation: payout ${evaluation['average_payout']:.2f} | "
+                    f"champion {evaluation['champion_rate']:.1%} | "
+                    f"runner-up {evaluation['runner_up_rate']:.1%} | "
+                    f"playoffs {evaluation['playoff_rate']:.1%}"
+                )
 
-        epsilon = max(0.02, epsilon * 0.95)
-        avg_reward = sum(block_rewards) / len(block_rewards)
-        reward_history.append(avg_reward)
-        print(f"Block {block + 1}: Avg Reward = {avg_reward:.2f} | Δ = {avg_reward - last_avg_reward:.2f}")
+            with open(q_file, "wb") as handle:
+                pickle.dump(Q, handle)
 
-        with open(q_file, "wb") as handle:
-            pickle.dump(Q, handle)
+            full_history = existing_records + reward_history
+            pd.DataFrame(full_history).to_csv(reward_history_file, index=False)
+            pd.DataFrame(evaluation_history).to_csv(evaluation_history_file, index=False)
+            last_avg_reward = avg_reward
+            block += 1
 
-        existing: list[float] = []
-        if os.path.exists(reward_history_file):
-            existing = pd.read_csv(reward_history_file, header=None)[0].tolist()
-
-        full_history = existing + reward_history
-        pd.Series(full_history).to_csv(reward_history_file, index=False)
-        last_avg_reward = avg_reward
+    except KeyboardInterrupt:
+        print("\n[Stopped] Training interrupted by user. Saved Q-table and CSV logs successfully.")
 
     return Q, reward_history
 
@@ -272,6 +434,7 @@ def main(league: str = "ppr_fd"):
         df,
         q_file=config["q_file"],
         reward_history_file=config["reward_history_file"],
+        evaluation_history_file=config["evaluation_history_file"],
         starter_limits=config.get("starter_limits"),
         position_limits=config.get("position_limits"),
     )
