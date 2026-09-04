@@ -38,8 +38,6 @@ LEAGUE_DATA_FOLDERS = {
 
 def load_latest_player_data(league_config):
     """Load the latest player data CSV file for the given league based on the naming convention."""
-    global all_samples
-    all_samples.clear()  # <-- This line clears out old entries!
     if league_config not in LEAGUE_DATA_FOLDERS:
         raise ValueError(f"Unknown league_config '{league_config}'. Choose one of: {list(LEAGUE_DATA_FOLDERS)}")
     folder = LEAGUE_DATA_FOLDERS[league_config]
@@ -51,11 +49,13 @@ def load_latest_player_data(league_config):
     print(f"Loading latest player data from: {latest}")
     data = pd.read_csv(latest)
     df = pd.DataFrame(data)
-    df = df.rename(columns={c: c.lower() for c in df.columns if c.lower() == "uncertainty"})
+    df = df.rename(columns={c: c.lower() for c in df.columns if c.lower() in ("uncertainty", "ceiling", "floor", "points", "sd_pts")})
     # Coerce numeric columns in case of spreadsheet export errors like "#VALUE!"
     numeric_cols = [c for c in ("points", "floor", "ceiling", "sd_pts", "uncertainty") if c in df.columns]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "Injury Prediction" in df.columns:
+        df["Injury Prediction"] = pd.to_numeric(df["Injury Prediction"], errors="coerce").fillna(0.0)
     bad_rows = df[df[numeric_cols].isna().any(axis=1)]
     if not bad_rows.empty:
         print(f"Dropping {len(bad_rows)} player(s) with bad numeric data: {bad_rows['Player'].tolist()}")
@@ -65,7 +65,10 @@ def load_latest_player_data(league_config):
 def load_weekly_matchups_sos_data():
     """Load and combine weekly SOS matchup files with inferred position labels."""
     folder_path = BASE_DIR / "data"
-    csv_files = sorted(folder_path.glob("*_matchups_2026_clean.csv"))
+    csv_files = sorted(
+        path for path in folder_path.glob("*_matchups_2026_clean.csv")
+        if path.name != "combined_matchups_2026_clean.csv"
+    )
     if not csv_files:
         raise FileNotFoundError(f"No *_matchups_2026_clean.csv files found in {folder_path}")
 
@@ -328,14 +331,6 @@ def build_weekly_matchups_from_sos(player_row, sos_df, weeks=17, default_star=3)
     ]
     candidate_keys = {normalize_player_key(name) for name in candidate_names if name}
 
-    sos = sos_df.copy()
-    sos["_player_key"] = sos["player_name"].map(normalize_player_key)
-    sos["_position"] = sos.get("Position", "").astype(str).str.upper()
-
-    filtered = sos[sos["_player_key"].isin(candidate_keys)]
-    if player_position and "_position" in filtered.columns:
-        filtered = filtered[(filtered["_position"] == player_position) | (filtered["_position"] == "")]
-
     bye_week_fallback = player_row.get("Bye Week", None)
     if pd.notna(bye_week_fallback):
         try:
@@ -345,28 +340,35 @@ def build_weekly_matchups_from_sos(player_row, sos_df, weeks=17, default_star=3)
     else:
         bye_week_fallback = None
 
-    if filtered.empty:
-        return build_uniform_weekly_matchups(weeks=weeks, bye_week=bye_week_fallback, default_star=default_star)
-
-    filtered = filtered.copy()
-    filtered["week"] = pd.to_numeric(filtered["week"], errors="coerce")
-    filtered = filtered.dropna(subset=["week"])
-    filtered["week"] = filtered["week"].astype(int)
-    filtered = filtered[filtered["week"].between(1, weeks)]
+    cache_key = "_weekly_matchup_profiles"
+    profiles = sos_df.attrs.get(cache_key)
+    if profiles is None:
+        profiles = {}
+        for row in sos_df.itertuples(index=False):
+            player_key = normalize_player_key(getattr(row, "player_name", ""))
+            position = str(getattr(row, "Position", "")).upper()
+            week_num = pd.to_numeric(getattr(row, "week", None), errors="coerce")
+            if not player_key or pd.isna(week_num) or not 1 <= int(week_num) <= weeks:
+                continue
+            opponent = str(getattr(row, "opponent", "")).upper()
+            star = getattr(row, "star_matchup_rating", default_star)
+            if pd.isna(star):
+                star = default_star
+            profiles.setdefault((player_key, position), {})[int(week_num)] = {
+                "week": int(week_num),
+                "star_rating": float(star),
+                "bye": opponent == "BYE",
+            }
+        sos_df.attrs[cache_key] = profiles
 
     by_week = {}
-    for _, row in filtered.iterrows():
-        week_num = int(row["week"])
-        opponent = str(row.get("opponent", "")).upper()
-        is_bye = opponent == "BYE"
-        star = row.get("star_matchup_rating", default_star)
-        if pd.isna(star):
-            star = default_star
-        by_week[week_num] = {
-            "week": week_num,
-            "star_rating": float(star),
-            "bye": bool(is_bye),
-        }
+    for player_key in candidate_keys:
+        by_week.update(profiles.get((player_key, ""), {}))
+        if player_position:
+            by_week.update(profiles.get((player_key, player_position), {}))
+
+    if not by_week:
+        return build_uniform_weekly_matchups(weeks=weeks, bye_week=bye_week_fallback, default_star=default_star)
 
     weekly_profile = []
     for week_num in range(1, weeks + 1):

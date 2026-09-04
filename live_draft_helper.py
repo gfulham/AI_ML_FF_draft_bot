@@ -1,211 +1,159 @@
-# This script is used while in a live draft
-# It pulls the current draft state from a google sheet
-# and using the pre-trained q-table to make recomendations for the next pick
+"""Recommend a pick from a live Google Sheet or a downloaded sheet CSV.
 
+The sheet must contain player projections plus these boolean columns:
+- Pick: TRUE once any manager drafts the player.
+- My Team: TRUE for players drafted by this draft slot.
+"""
+
+from __future__ import annotations
+
+import argparse
 import pickle
-from py_compile import main
-import pandas as pd
 from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
+
 from draft_sim_class import DraftSim
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from RL_draft_env import LEAGUE_CONFIGS
 
-# Define nested_defaultdict if needed for unpickling
-# Helps the q state load correctly
+BASE_DIR = Path(__file__).resolve().parent
+GOOGLE_KEY_FILE = BASE_DIR / "config" / "FantasyDraftBotKey.json"
+DEFAULT_SPREADSHEET = "Fantasy Data 2026"
+WORKSHEETS = {
+    "ppr": "All Data PPR 2WR",
+    "keeper": "All Data PPR 3WR",
+    "ppr_fd": "All Data PPR plus FD",
+}
+REQUIRED_COLUMNS = {"Player", "Position", "ESPN ADP", "ESPN ECR", "VOR", "Pick", "My Team"}
+
+
 def nested_defaultdict():
-    return defaultdict(nested_defaultdict)
+    """Compatibility factory for Q-tables serialized by RL_draft_env.py."""
+    return defaultdict(float)
 
-def connect_to_google_sheet():
-    # Authenticate google sheet
+
+def parse_sheet_bool(values: pd.Series, column: str) -> pd.Series:
+    """Convert Google Sheets booleans while rejecting ambiguous values."""
+    normalized = values.fillna(False).astype(str).str.strip().str.lower()
+    valid_values = {"true", "false", "", "nan"}
+    invalid = normalized[~normalized.isin(valid_values)]
+    if not invalid.empty:
+        raise ValueError(f"{column} must contain only TRUE or FALSE. Invalid values: {invalid.unique().tolist()}")
+    return normalized.eq("true")
+
+
+def prepare_draft_frame(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalize live-sheet data without changing draft flags."""
+    data = data.copy()
+    data.columns = data.columns.str.strip()
+    missing = REQUIRED_COLUMNS - set(data.columns)
+    if missing:
+        raise ValueError(f"Sheet is missing required columns: {sorted(missing)}")
+
+    for column in ("ESPN ADP", "ESPN ECR", "VOR"):
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["Player", "Position", "ESPN ADP", "ESPN ECR", "VOR"])
+    data["Player"] = data["Player"].astype(str).str.strip()
+    if data["Player"].duplicated().any():
+        raise ValueError("Player names must be unique in the sheet.")
+
+    data["Pick"] = parse_sheet_bool(data["Pick"], "Pick")
+    data["My Team"] = parse_sheet_bool(data["My Team"], "My Team")
+    if (data["My Team"] & ~data["Pick"]).any():
+        raise ValueError("Every player marked My Team must also be marked Pick.")
+    return data
+
+
+def load_google_sheet(spreadsheet: str, worksheet: str) -> pd.DataFrame:
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+    except ImportError as error:
+        raise RuntimeError(
+            "Google Sheets support requires gspread and oauth2client. "
+            "Install them with: pip install gspread oauth2client"
+        ) from error
+    if not GOOGLE_KEY_FILE.exists():
+        raise FileNotFoundError(f"Google service-account key not found: {GOOGLE_KEY_FILE}")
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(r"C:\Users\onlyu\OneDrive\Fantasy Football\\Draft_strategy\FantasyDraftBotKey.json", scope)
-    client = gspread.authorize(creds)
-    return client
-# Authenticate google sheet
-#scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-#creds = ServiceAccountCredentials.from_json_keyfile_name(r"C:\Users\onlyu\OneDrive\Fantasy Football\\Draft_strategy\FantasyDraftBotKey.json", scope)
-#client = gspread.authorize(creds)
-#spreadsheet_id = '1QLtApXReHc0W0mR_HauEY0545rHS6oiu77XZqKb1cQw'
-
-def load_draft_state_from_google_sheet():
-    client = connect_to_google_sheet()
-    sheet = client.open("2025 Fantasy Sheets").worksheet("VBD Indexed Greg")
-    data = sheet.get_all_records()
-    df = pd.DataFrame(data)
-    # Clean Data
-    df = pd.DataFrame(data).replace("", pd.NA)
-    df["ESPN ADP"] = pd.to_numeric(df["ESPN ADP"], errors="coerce")
-    df["Rolling ADP"] = pd.to_numeric(df["Rolling ADP"], errors="coerce")
-    df = df.dropna(subset=["ESPN ADP"])
-    return df
-
-#client = connect_to_google_sheet()
-#sheet = client.open("2025 Fantasy Sheets").worksheet("VBD Indexed Greg")
-#data = sheet.get_all_records()
-#df = pd.DataFrame(data)
-
-#df.head(10)
-
-# Not usedin current state, but kept for reference
-"""for col in ["Rolling Percent of VBD", "Rolling Percent of VBD Normalized", "Slice of Flex Pie"]:
-    if col in df.columns:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace('%', '', regex=False)
-            .astype(float)
-        )"""
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(str(GOOGLE_KEY_FILE), scope)
+    client = gspread.authorize(credentials)
+    return pd.DataFrame(client.open(spreadsheet).worksheet(worksheet).get_all_records())
 
 
-def get_available_players(df):
-    picked_players = df[df["Pick"].notnull()]["Player"].tolist()
-    available_players = df[~df["Player"].isin(picked_players)].copy()
-    return available_players
+def build_live_simulator(data: pd.DataFrame, config: dict, draft_slot: int) -> DraftSim:
+    """Build model state from picked flags and the user's roster only."""
+    num_teams = 12
+    if not 1 <= draft_slot <= num_teams:
+        raise ValueError(f"draft slot must be between 1 and {num_teams}")
 
-def get_rosters(df):
-    rosters = [[] for _ in range(12)]  # Assuming 12 teams
-    for _, row in df[df["Pick"].notnull()].iterrows():
-        team_idx = int(row["Team"]) - 1  # Convert 1-12 to 0-11
-        rosters[team_idx].append(row)
-    return rosters
+    simulator = DraftSim(
+        data,
+        num_rounds=config.get("num_rounds", 12),
+        num_teams=num_teams,
+        my_pick=draft_slot - 1,
+        starter_limits=config["starter_limits"],
+        position_limits=config["position_limits"],
+    )
+    picked = set(data.loc[data["Pick"], "Player"])
+    if len(picked) > simulator.total_picks:
+        raise ValueError(f"The sheet has {len(picked)} picks, exceeding the {simulator.total_picks}-pick draft.")
 
-def get_current_pick(rosters):
-    return sum(len(team) for team in rosters)  # Total picks made so far
-
-def get_my_team(rosters, my_pick):
-    return rosters[my_pick - 1]  # Assuming my_pick is 1-indexed
-
-def get_legal_candidates(sim, my_team):
-    available_players = sim.available_players
-    legal_candidates = [
-        p for p in available_players["Player"]
-        if sim.can_add_player(my_team, available_players[available_players["Player"] == p].iloc[0].to_dict())
+    # The Q-table state needs availability, global pick count, and our roster only.
+    # Sheet row order is rankings, not chronological draft order, so do not replay it.
+    simulator.available_set.difference_update(picked)
+    simulator.rosters[simulator.my_pick] = [
+        simulator._player_dict[player]
+        for player in data.loc[data["My Team"], "Player"]
     ]
-    return legal_candidates
+    simulator.current_pick = len(picked)
+    simulator.done = simulator.current_pick >= simulator.total_picks
+    return simulator
 
-def get_best_pick(Q, state, legal_candidates):
-    # returns the legal candidate with the max q value/reward for the current state
-    q_vals = {a: Q[state][a] for a in legal_candidates if a in Q[state]}
-    if q_vals:
-        best_pick = max(q_vals, key=q_vals.get)
-        return best_pick, sorted(q_vals.items(), key=lambda x: x[1], reverse=True)
+
+def get_ranked_recommendations(simulator: DraftSim, q_table: dict, count: int) -> list[tuple[str, float]]:
+    state = simulator.get_state()
+    candidates = simulator.get_next_n_per_position()
+    my_team = simulator.rosters[simulator.my_pick]
+    legal_candidates = [
+        player
+        for player in candidates
+        if simulator.can_add_player(my_team, simulator._player_dict[player], simulator.my_pick)
+    ]
+    ranked = [(player, q_table[state][player]) for player in legal_candidates if player in q_table[state]]
+    return sorted(ranked, key=lambda item: item[1], reverse=True)[:count]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Get Q-table recommendations from the current draft sheet.")
+    parser.add_argument("--draft-slot", type=int, required=True, help="Your one-based draft position (1-12).")
+    parser.add_argument("--league", choices=LEAGUE_CONFIGS, default="ppr_fd")
+    parser.add_argument("--csv", type=Path, help="Use a downloaded sheet CSV instead of Google Sheets.")
+    parser.add_argument("--spreadsheet", default=DEFAULT_SPREADSHEET)
+    parser.add_argument("--worksheet", help="Override the league's default worksheet name.")
+    parser.add_argument("--top", type=int, default=10, help="Number of recommendations to display.")
+    args = parser.parse_args()
+
+    config = LEAGUE_CONFIGS[args.league]
+    raw_data = pd.read_csv(args.csv) if args.csv else load_google_sheet(
+        args.spreadsheet, args.worksheet or WORKSHEETS[args.league]
+    )
+    simulator = build_live_simulator(prepare_draft_frame(raw_data), config, args.draft_slot)
+    with Path(config["q_file"]).open("rb") as file_handle:
+        q_table = pickle.load(file_handle)
+
+    recommendations = get_ranked_recommendations(simulator, q_table, args.top)
+    print(f"Picks recorded: {simulator.current_pick}")
+    print(f"Your draft slot: {args.draft_slot}")
+    print("Your roster:", ", ".join(player["Player"] for player in simulator.rosters[simulator.my_pick]) or "(empty)")
+    if recommendations:
+        print("Recommendations:")
+        for rank, (player, value) in enumerate(recommendations, start=1):
+            print(f"{rank}. {player}: {value:.3f}")
     else:
-        return None, None
+        print("No learned Q-values exist for this state and available candidate set.")
 
-# load the q-table from a pickle file which stores states and their corresponding Q-values for actions
-def load_q_table(file_path):
-    with open(file_path, 'rb') as f:
-        Q = pickle.load(f)
-    return Q
 
-def main():
-    df = load_draft_state_from_google_sheet()
-    available_players = get_available_players(df)
-    rosters = get_rosters(df)
-    current_pick = get_current_pick(rosters)
-
-    # Provides the current state of the draft
-    # State including my team, available players, and current pick
-    sim = DraftSim(df, 
-                   num_teams=12, 
-                   num_rounds=15, 
-                   my_pick=4, 
-                   rosters=rosters, 
-                   available_players=available_players, 
-                   current_pick=current_pick)
-
-    
-    my_team = get_my_team(rosters, sim.my_pick)
-
-    # Returns the current state of the draft based on draft_sim_class.py
-    state = sim.get_state()
-    # Finding which players to pull q values for
-    legal_candidates = get_legal_candidates(sim, my_team)
-    Q = load_q_table("q_table.pkl")
-    best_pick, sorted_q_vals = get_best_pick(Q, state, legal_candidates)
-
-    print(f"My team: {my_team}")
-    print(f"Current pick number: {sim.current_pick}")
-    print(f"Starting rosters: {rosters}")
-    print(f"My pick: {sim.my_pick}")
-    print(f"Number of teams: {sim.num_teams}")
-
-    # Print the state for debugging
-    for _ in state:
-        print(f"_{_}")
-
-    # Print the recommended pick and top candidates by Q-value  
-    if best_pick:
-        print("Recommended pick:", best_pick)
-        print("Top candidates by Q-value:")
-        print(sorted_q_vals)
-    # if state has not been simulated before, add fallback or pick random 
-    else:
-        print("No Q-values available for this state. Consider fallback logic.")
-
-# this way it doesn't run on import, but only when executed directly
 if __name__ == "__main__":
     main()
-"""not_available = df[df["Pick"].notnull()]
-print(f"Not available players: {not_available['Player'].tolist()}")
-
-picked_players = df[df["Pick"].notnull()]["Player"].tolist()
-#print(f"Picked players: {picked_players}")
-
-available_players = df[~df["Player"].isin(picked_players)].copy()
-#display(available.head(20))
-
-rosters = [[] for _ in range(12)] # Assuming 12 teams
-for _, row in not_available.iterrows():
-    team_idx = int(row["Team"]) - 1  # Convert 1-12 to 0-11
-    rosters[team_idx].append(row)
-    
-current_pick = sum(len(team) for team in rosters)  # Total picks made so far
-
-# Team rosters initialized
-sim = DraftSim(df, num_teams=12, 
-            num_rounds=15, 
-            my_pick=4, 
-            rosters=rosters,
-            available_players=available_players,
-            current_pick=current_pick
-)
-
-#print(starting_rosters)
-
-# Assign picked players to their teams
-for _, row in not_available.iterrows():
-    team_idx = int(row["Team"]) - 1  # Convert 1-12 to 0-11
-    rosters[team_idx].append(row)
-    
-my_team = rosters[sim.my_pick - 1]  # Assuming my_pick is 1-indexed
-state = sim.get_state()
-
-# Print statements to check code
-print(f"My team: {my_team}")
-
-print(f"Current pick: {sim.current_pick}")
-print(f"Starting rosters: {rosters}")
-print(sim.my_pick)
-print(sim.num_teams)
-
-for _ in state:
-    print(f"_{_}")
-
-# Get available players from your sheet
-available_players = sim.available_players
-legal_candidates = [
-    p for p in available_players["Player"]
-    if sim.can_add_player(my_team, available_players[available_players["Player"] == p].iloc[0].to_dict())
-]
-
-# Get Q-values and recommend best pick
-q_vals = {a: Q[state][a] for a in legal_candidates if a in Q[state]}
-if q_vals:
-    best_pick = max(q_vals, key=q_vals.get)
-    print("Recommended pick:", best_pick)
-    print("Top candidates by Q-value:")
-    print(sorted(q_vals.items(), key=lambda x: x[1], reverse=True))
-else:
-    print("No Q-values available for this state. Consider fallback logic.")
-"""

@@ -26,6 +26,33 @@ from sample_player_outcomes import (
 # (e.g. from RL_draft_env.LEAGUE_CONFIGS) for leagues like the 3-WR keeper league.
 STARTER_LIMITS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1}
 FLEX_ELIGIBLE = ["RB", "WR", "TE"]
+POSITION_WEEKLY_VOLATILITY = {
+    "QB": 0.20,
+    "RB": 0.25,
+    "WR": 0.27,
+    "TE": 0.30,
+}
+INJURY_MULTIPLIERS = {
+    "WR1": {"WR2": 1.15, "WR3": 1.08, "TE1": 1.08, "RB1": 1.03},
+    "WR2": {"WR3": 1.10, "TE1": 1.05},
+    "RB1": {"RB2": 1.30, "RB3": 1.10},
+    "TE1": {"WR2": 1.05, "WR3": 1.03},
+}
+DEFAULT_WEEKLY_VOLATILITY = None
+PLACEMENT_REWARDS = {
+    1: 6.0,
+    2: 4.0,
+    3: 2.5,
+    4: 2.0,
+    5: 1.5,
+    6: 1.0,
+    7: 0.5,
+    8: 0.4,
+    9: 0.3,
+    10: 0.2,
+    11: 0.1,
+    12: 0.0,
+}
 rng = np.random.default_rng()
 
 
@@ -112,13 +139,46 @@ def _sample_roster_season_totals(roster):
     return np.array(totals, dtype=np.float64)
 
 
-def batch_sample_roster_weekly_points(team_rosters, weeks=17, sos_df=None):
-    """Vectorized sampling of weekly point matrices across all teams and players."""
+def batch_sample_roster_weekly_points(
+    team_rosters,
+    weeks=17,
+    sos_df=None,
+    weekly_volatility=DEFAULT_WEEKLY_VOLATILITY,
+    return_projected_scores=False,
+):
+    """Vectorized weekly scores using position volatility or a global override."""
     n_teams = len(team_rosters)
-    max_roster_size = max(len(r) for r in team_rosters)
+    max_roster_size = max(len(r) for r in team_rosters) if team_rosters else 0
     weekly_scores = np.zeros((n_teams, max_roster_size, weeks), dtype=np.float64)
+    projected_scores = np.zeros((n_teams, max_roster_size, weeks), dtype=np.float64)
     team_positions = []
 
+    # 1. Sample 3-game injuries across all drafted players and track NFL team injuries per week
+    # nfl_team_injuries[nfl_team][week_idx] -> list of injured team_pos strings (e.g. ["RB1"])
+    from collections import defaultdict
+    nfl_team_injuries = defaultdict(lambda: defaultdict(list))
+    player_missed_weeks = {}
+
+    for t, roster in enumerate(team_rosters):
+        for i, p in enumerate(roster):
+            raw_inj = p.get("Injury Prediction", 0.0)
+            try:
+                inj_prob = float(raw_inj) if pd.notna(raw_inj) else 0.0
+            except (TypeError, ValueError):
+                inj_prob = 0.0
+
+            if inj_prob > 0.0 and rng.random() < inj_prob:
+                start_w = int(rng.integers(0, max(1, weeks - 2)))
+                missed = set(range(start_w, min(weeks, start_w + 3)))
+                player_missed_weeks[(t, i)] = missed
+
+                nfl_team = str(p.get("Team", "")).strip().upper()
+                team_pos = str(p.get("Team Position", "")).strip().upper()
+                if nfl_team and team_pos:
+                    for w in missed:
+                        nfl_team_injuries[nfl_team][w].append(team_pos)
+
+    # 2. Build weekly projection and score matrices per team
     for t, roster in enumerate(team_rosters):
         n_players = len(roster)
         if n_players == 0:
@@ -130,30 +190,58 @@ def batch_sample_roster_weekly_points(team_rosters, weeks=17, sos_df=None):
 
         season_totals = _sample_roster_season_totals(roster)
 
-        M = np.ones((n_players, weeks), dtype=np.float64)
+        # Baseline matrix for health & SOS/bye
+        M_base = np.ones((n_players, weeks), dtype=np.float64)
         for i, p in enumerate(roster):
             if sos_df is not None:
                 matchups = build_weekly_matchups_from_sos(pd.Series(p), sos_df=sos_df, weeks=weeks)
                 for w_idx, w_data in enumerate(matchups[:weeks]):
                     if w_data.get("bye", False):
-                        M[i, w_idx] = 0.0
+                        M_base[i, w_idx] = 0.0
                     else:
-                        M[i, w_idx] = matchup_multiplier(w_data.get("star_rating", 3), bye_week=False)
+                        M_base[i, w_idx] = matchup_multiplier(w_data.get("star_rating", 3), bye_week=False)
             else:
                 bye = p.get("Bye Week")
                 if pd.notna(bye):
                     try:
                         bye_w = int(bye)
                         if 1 <= bye_w <= weeks:
-                            M[i, bye_w - 1] = 0.0
+                            M_base[i, bye_w - 1] = 0.0
                     except (TypeError, ValueError):
                         pass
 
-        total_mult = M.sum(axis=1, keepdims=True)
-        safe_mult = np.where(total_mult > 0, total_mult, 1.0)
-        mu = np.where(total_mult > 0, (season_totals[:, np.newaxis] * M) / safe_mult, 0.0)
+        total_base_mult = M_base.sum(axis=1, keepdims=True)
+        safe_base_mult = np.where(total_base_mult > 0, total_base_mult, 1.0)
 
-        sigma = np.maximum(1.0, mu * 0.35)
+        # Build actual multiplier matrix M incorporating injuries & depth chart handcuff boosts
+        M = M_base.copy()
+        for i, p in enumerate(roster):
+            nfl_team = str(p.get("Team", "")).strip().upper()
+            team_pos = str(p.get("Team Position", "")).strip().upper()
+            missed = player_missed_weeks.get((t, i), set())
+
+            for w in range(weeks):
+                if w in missed:
+                    M[i, w] = 0.0
+                elif nfl_team:
+                    injured_pos_list = nfl_team_injuries[nfl_team].get(w, [])
+                    for inj_pos in injured_pos_list:
+                        boost_dict = INJURY_MULTIPLIERS.get(inj_pos, {})
+                        if team_pos in boost_dict:
+                            M[i, w] *= boost_dict[team_pos]
+
+        projected_totals = np.array([float(player.get("points", 0.0)) for player in roster])
+        projected_mu = np.where(total_base_mult > 0, (projected_totals[:, np.newaxis] * M) / safe_base_mult, 0.0)
+        mu = np.where(total_base_mult > 0, (season_totals[:, np.newaxis] * M) / safe_base_mult, 0.0)
+
+        if weekly_volatility is None:
+            player_volatility = np.array(
+                [POSITION_WEEKLY_VOLATILITY.get(position, 0.25) for position in positions],
+                dtype=np.float64,
+            )[:, np.newaxis]
+        else:
+            player_volatility = float(weekly_volatility)
+        sigma = np.maximum(1.0, mu * player_volatility)
         raw_draws = rng.normal(mu, sigma)
         raw_draws = np.maximum(0.0, raw_draws)
         raw_draws = np.where(M == 0.0, 0.0, raw_draws)
@@ -167,19 +255,22 @@ def batch_sample_roster_weekly_points(team_rosters, weeks=17, sos_df=None):
         )
 
         weekly_scores[t, :n_players, :] = raw_draws * scale
+        projected_scores[t, :n_players, :] = projected_mu
 
+    if return_projected_scores:
+        return weekly_scores, team_positions, projected_scores
     return weekly_scores, team_positions
 
 
-def _calculate_team_weekly_lineup_scores(roster_positions, roster_scores, starter_limits):
-    """Vectorized calculation of optimal starting lineup scores across all weeks for a team."""
-    n_players, weeks = roster_scores.shape
+def _select_projected_lineup_slots(roster_positions, projected_scores, starter_limits):
+    """Select each week's legal starters from projected scores, not realized outcomes."""
+    n_players, weeks = projected_scores.shape
     if n_players == 0:
-        return np.zeros(weeks, dtype=np.float64)
+        return np.empty((0, weeks), dtype=object)
 
     starter_limits = starter_limits or STARTER_LIMITS
     used_mask = np.zeros((n_players, weeks), dtype=bool)
-    total_scores = np.zeros(weeks, dtype=np.float64)
+    slots = np.full((n_players, weeks), "BENCH", dtype=object)
     week_indices = np.arange(weeks)
 
     for pos, limit in starter_limits.items():
@@ -190,31 +281,60 @@ def _calculate_team_weekly_lineup_scores(roster_positions, roster_scores, starte
             continue
 
         n_pick = min(limit, len(pos_indices))
-        pos_scores = roster_scores[pos_indices, :]
+        pos_scores = projected_scores[pos_indices, :].copy()
+        pos_scores[pos_scores <= 0.0] = -1e9
         sorted_rel_indices = np.argsort(-pos_scores, axis=0)
         top_rel_indices = sorted_rel_indices[:n_pick, :]
 
         top_player_indices = pos_indices[top_rel_indices]
-        picked_scores = roster_scores[top_player_indices, week_indices]
-        total_scores += picked_scores.sum(axis=0)
-        used_mask[top_player_indices, week_indices] = True
+        top_scores = pos_scores[top_rel_indices, week_indices]
+        selected_mask = top_scores > 0.0
+        selected_players, selected_weeks = np.where(selected_mask)
+        used_mask[top_player_indices[selected_players, selected_weeks], selected_weeks] = True
+        slots[top_player_indices[selected_players, selected_weeks], selected_weeks] = pos
 
     flex_limit = starter_limits.get("FLEX", 0)
     if flex_limit > 0:
         flex_eligible_mask = np.isin(roster_positions, FLEX_ELIGIBLE)
-        flex_scores = roster_scores.copy()
+        flex_scores = projected_scores.copy()
         flex_scores[~flex_eligible_mask, :] = -1e9
         flex_scores[used_mask] = -1e9
+        flex_scores[flex_scores <= 0.0] = -1e9
 
         n_pick = min(flex_limit, n_players)
         sorted_flex_indices = np.argsort(-flex_scores, axis=0)
         top_flex_indices = sorted_flex_indices[:n_pick, :]
 
-        flex_picked_scores = flex_scores[top_flex_indices, week_indices]
-        flex_picked_scores = np.maximum(flex_picked_scores, 0.0)
-        total_scores += flex_picked_scores.sum(axis=0)
+        top_scores = flex_scores[top_flex_indices, week_indices]
+        selected_mask = top_scores > 0.0
+        selected_players, selected_weeks = np.where(selected_mask)
+        slots[top_flex_indices[selected_players, selected_weeks], selected_weeks] = "FLEX"
 
-    return total_scores
+    return slots
+
+
+def _select_weekly_waiver(lineup_slots, starter_limits, waiver_weekly_projections):
+    """Use at most one deterministic waiver for a missing required starter each week."""
+    weeks = lineup_slots.shape[1]
+    waivers = [None] * weeks
+    if not waiver_weekly_projections:
+        return waivers
+
+    for week_index in range(weeks):
+        missing_positions = [
+            position
+            for position, limit in starter_limits.items()
+            if position != "FLEX"
+            and limit > 0
+            and np.count_nonzero(lineup_slots[:, week_index] == position) < limit
+        ]
+        if missing_positions:
+            position = max(missing_positions, key=lambda item: waiver_weekly_projections.get(item, 0.0))
+            points = float(waiver_weekly_projections.get(position, 0.0))
+            if points > 0.0:
+                waivers[week_index] = {"position": position, "points": points}
+
+    return waivers
 
 
 def simulate_league(
@@ -223,15 +343,15 @@ def simulate_league(
     my_team_index=None,
     sos_df=None,
     starter_limits=None,
-    win_rate_reward_weight=0.5,
-    points_reward_weight=0.5,
+    weekly_volatility=DEFAULT_WEEKLY_VOLATILITY,
+    waiver_weekly_projections=None,
 ):
     """Simulate a season from drafted rosters.
 
-    Twelve teams play a 14-week regular season. The top six teams qualify
-    for playoffs: seeds 1 and 2 receive Week 15 byes, seeds 3 vs. 6 and
-    4 vs. 5 play in Week 15, semifinals are in Week 16, and the championship
-    is in Week 17. Week 18 is not simulated.
+    Twelve teams accumulate lineup points across a 14-week regular season.
+    The top six qualify for playoffs: seeds 1 and 2 receive Week 15 byes,
+    seeds 3 through 6 compete for the other two spots, and the remaining four
+    teams are ranked by average playoff score from Weeks 16 and 17.
 
     Args:
         team_rosters: list of team rosters, where each roster is a list of player dicts.
@@ -244,9 +364,10 @@ def simulate_league(
         starter_limits: optional per-league starting lineup requirements (e.g. from
             RL_draft_env.LEAGUE_CONFIGS["keeper"]["starter_limits"] for a 3-WR league).
             Defaults to the standard 2-WR-starter STARTER_LIMITS.
-        win_rate_reward_weight: reward multiplier for regular-season win percentage.
-        points_reward_weight: reward multiplier for regular-season points divided by
-            the league-average regular-season points.
+        weekly_volatility: optional coefficient of variation global override. When
+            omitted, uses POSITION_WEEKLY_VOLATILITY for each player's position.
+        waiver_weekly_projections: optional replacement-level points by position.
+            At most one waiver fills an otherwise empty required non-FLEX slot each week.
 
     Returns:
         dict with regular-season standings, season points, playoff results, and rewards.
@@ -259,90 +380,132 @@ def simulate_league(
 
     starter_limits = starter_limits or STARTER_LIMITS
     regular_season_weeks = 14
-    matchups = randomize_weekly_matchups(regular_season_weeks, n_teams)
+    # Retired H2H scheduling: Weeks 1-14 now rank every team solely by lineup points.
+    # matchups = randomize_weekly_matchups(regular_season_weeks, n_teams)
 
-    weekly_scores, team_positions = batch_sample_roster_weekly_points(
-        team_rosters, weeks=weeks, sos_df=sos_df
+    weekly_scores, team_positions, projected_scores = batch_sample_roster_weekly_points(
+        team_rosters,
+        weeks=weeks,
+        sos_df=sos_df,
+        weekly_volatility=weekly_volatility,
+        return_projected_scores=True,
     )
     team_weekly_lineup_scores = np.zeros((n_teams, weeks), dtype=np.float64)
+    team_weekly_lineup_slots = []
+    team_weekly_waivers = []
     for t in range(n_teams):
-        team_weekly_lineup_scores[t] = _calculate_team_weekly_lineup_scores(
-            team_positions[t], weekly_scores[t], starter_limits=starter_limits
+        lineup_slots = _select_projected_lineup_slots(
+            team_positions[t],
+            projected_scores[t, :len(team_rosters[t]), :],
+            starter_limits=starter_limits,
+        )
+        team_weekly_lineup_slots.append(lineup_slots)
+        weekly_waivers = _select_weekly_waiver(
+            lineup_slots,
+            starter_limits,
+            waiver_weekly_projections,
+        )
+        team_weekly_waivers.append(weekly_waivers)
+        selected = lineup_slots != "BENCH"
+        team_weekly_lineup_scores[t] = np.where(
+            selected,
+            weekly_scores[t, :len(team_rosters[t]), :],
+            0.0,
+        ).sum(axis=0)
+        team_weekly_lineup_scores[t] += np.array(
+            [waiver["points"] if waiver else 0.0 for waiver in weekly_waivers]
         )
 
-    wins = {i: 0 for i in range(n_teams)}
-    points_for = {i: 0.0 for i in range(n_teams)}
-    regular_season = []
-    for week_idx, weekly in enumerate(matchups, start=1):
-        weekly_results = []
-        for t1, t2 in weekly:
-            score1 = float(team_weekly_lineup_scores[t1, week_idx - 1])
-            score2 = float(team_weekly_lineup_scores[t2, week_idx - 1])
-            points_for[t1] += score1
-            points_for[t2] += score2
-            winner = t1 if score1 >= score2 else t2
-            wins[winner] += 1
-            weekly_results.append({"teams": (t1, t2), "scores": (score1, score2), "winner": winner})
-        regular_season.append({"week": week_idx, "matchups": weekly_results})
+    # Retired H2H regular season and elimination bracket:
+    # wins = {i: 0 for i in range(n_teams)}
+    # points_for = {i: 0.0 for i in range(n_teams)}
+    # for week_idx, weekly in enumerate(matchups, start=1):
+    #     for t1, t2 in weekly:
+    #         score1 = float(team_weekly_lineup_scores[t1, week_idx - 1])
+    #         score2 = float(team_weekly_lineup_scores[t2, week_idx - 1])
+    #         points_for[t1] += score1
+    #         points_for[t2] += score2
+    #         wins[t1 if score1 >= score2 else t2] += 1
 
-    regular_season_points_for = points_for.copy()
-    seeds = sorted(range(n_teams), key=lambda team: (-wins[team], -points_for[team], team))
-
-    def play_matchup(team_one, team_two, week):
-        score_one = float(team_weekly_lineup_scores[team_one, week - 1])
-        score_two = float(team_weekly_lineup_scores[team_two, week - 1])
-        points_for[team_one] += score_one
-        points_for[team_two] += score_two
-        return (team_one if score_one >= score_two else team_two), score_one, score_two
-
-    seed_one, seed_two, seed_three, seed_four, seed_five, seed_six = seeds[:6]
-    winner_three_six, score_three, score_six = play_matchup(seed_three, seed_six, 15)
-    winner_four_five, score_four, score_five = play_matchup(seed_four, seed_five, 15)
-
-    semifinal_one_winner, score_one, score_four_five = play_matchup(seed_one, winner_four_five, 16)
-    semifinal_two_winner, score_two, score_three_six = play_matchup(seed_two, winner_three_six, 16)
-    champion, championship_score_one, championship_score_two = play_matchup(
-        semifinal_one_winner, semifinal_two_winner, 17
-    )
-    runner_up = semifinal_two_winner if champion == semifinal_one_winner else semifinal_one_winner
-
-    team_rewards = {i: 0.0 for i in range(n_teams)}
-    team_rewards[champion] = 7.0
-    team_rewards[runner_up] = 5.0
-    average_regular_season_points = float(np.mean(list(regular_season_points_for.values())))
-    win_rate_rewards = {team: wins[team] / regular_season_weeks for team in range(n_teams)}
-    points_rewards = {
-        team: regular_season_points_for[team] / average_regular_season_points
-        if average_regular_season_points else 0.0
+    regular_season_points_for = {
+        team: float(team_weekly_lineup_scores[team, :regular_season_weeks].sum())
         for team in range(n_teams)
     }
-    for team in range(n_teams):
-        team_rewards[team] += (
-            win_rate_reward_weight * win_rate_rewards[team]
-            + points_reward_weight * points_rewards[team]
-        )
+    regular_season = [
+        {
+            "week": week,
+            "team_scores": {
+                team: float(team_weekly_lineup_scores[team, week - 1])
+                for team in range(n_teams)
+            },
+        }
+        for week in range(1, regular_season_weeks + 1)
+    ]
+    seeds = sorted(range(n_teams), key=lambda team: (-regular_season_points_for[team], team))
+
+    seed_one, seed_two, seed_three, seed_four, seed_five, seed_six = seeds[:6]
+    week_15_scores = {
+        team: float(team_weekly_lineup_scores[team, 14])
+        for team in (seed_three, seed_four, seed_five, seed_six)
+    }
+    week_15_ranking = sorted(
+        week_15_scores,
+        key=lambda team: (-week_15_scores[team], -regular_season_points_for[team], team),
+    )
+    advancing_teams = (seed_one, seed_two, *week_15_ranking[:2])
+    eliminated_teams = week_15_ranking[2:]
+    playoff_scores = {team: [] for team in advancing_teams}
+
+    playoff_week_results = {}
+    for week in (16, 17):
+        week_scores = {
+            team: float(team_weekly_lineup_scores[team, week - 1])
+            for team in advancing_teams
+        }
+        playoff_week_results[f"week_{week}"] = week_scores
+        for team, score in week_scores.items():
+            playoff_scores[team].append(score)
+
+    playoff_average_scores = {
+        team: float(np.mean(scores)) for team, scores in playoff_scores.items()
+    }
+    playoff_ranking = sorted(
+        advancing_teams,
+        key=lambda team: (-playoff_average_scores[team], -regular_season_points_for[team], team),
+    )
+    final_placements = [*playoff_ranking, *eliminated_teams, *seeds[6:]]
+    placement_by_team = {team: place for place, team in enumerate(final_placements, start=1)}
+    team_rewards = {team: PLACEMENT_REWARDS[placement_by_team[team]] for team in range(n_teams)}
+
+    # Retired reward system: champion/runner-up payouts plus H2H win rate and points bonuses.
+    # team_rewards = {i: 0.0 for i in range(n_teams)}
+    # team_rewards[champion] = 7.0
+    # team_rewards[runner_up] = 5.0
+    # team_rewards[team] += 0.5 * (wins[team] / regular_season_weeks)
+    # team_rewards[team] += 0.5 * (regular_season_points_for[team] / average_regular_season_points)
     return {
-        "standings": wins,
-        "points_for": points_for,
+        "standings": regular_season_points_for,
+        "points_for": regular_season_points_for,
         "regular_season_points_for": regular_season_points_for,
         "regular_season": regular_season,
-        "win_rate_rewards": win_rate_rewards,
-        "points_rewards": points_rewards,
+        "weekly_player_projections": projected_scores,
+        "weekly_player_outcomes": weekly_scores,
+        "weekly_lineup_slots": team_weekly_lineup_slots,
+        "weekly_waivers": team_weekly_waivers,
+        "win_rate_rewards": None,
+        "points_rewards": None,
         "seeds": seeds,
         "playoffs": {
-            "week_15": [
-                {"teams": (seed_three, seed_six), "scores": (score_three, score_six), "winner": winner_three_six},
-                {"teams": (seed_four, seed_five), "scores": (score_four, score_five), "winner": winner_four_five},
-            ],
-            "week_16": [
-                {"teams": (seed_one, winner_four_five), "scores": (score_one, score_four_five), "winner": semifinal_one_winner},
-                {"teams": (seed_two, winner_three_six), "scores": (score_two, score_three_six), "winner": semifinal_two_winner},
-            ],
-            "champion": champion,
-            "runner_up": runner_up,
-            "championship_teams": (semifinal_one_winner, semifinal_two_winner),
-            "championship_scores": (championship_score_one, championship_score_two),
+            "bye_teams": (seed_one, seed_two),
+            "week_15": week_15_scores,
+            "week_16": playoff_week_results["week_16"],
+            "week_17": playoff_week_results["week_17"],
+            "advancing_teams": advancing_teams,
+            "eliminated_teams": eliminated_teams,
+            "playoff_average_scores": playoff_average_scores,
         },
+        "final_placements": final_placements,
+        "placement_by_team": placement_by_team,
         "team_rewards": team_rewards,
     }
 
